@@ -449,6 +449,25 @@ void transpose_kv_cache_by_block_meta(
     return;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_sum_lstm_meta(
+    const at::Tensor& states_4d,
+    const at::Tensor& z4_4d,
+    const at::Tensor& prev_cell,
+    const c10::optional<at::Tensor>& w_cell,
+    const c10::optional<at::Tensor>& b_cell,
+    const c10::optional<at::Tensor>& w_state,
+    const c10::optional<at::Tensor>& b_state,
+    double alpha,
+    double eps_cell,
+    double eps_state,
+    bool use_fast_gelu)
+{
+    // 输出形状与 prev_cell 相同
+    at::Tensor out_state = at::empty_symint(prev_cell.sym_sizes(), prev_cell.options());
+    at::Tensor out_cell = at::empty_symint(prev_cell.sym_sizes(), prev_cell.options());
+    return std::tuple<at::Tensor, at::Tensor>(out_state, out_cell);
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -491,5 +510,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_add_rms_norm_bias", &vllm_ascend::meta::npu_add_rms_norm_bias_meta);
     // transpose_kv_cache_by_block
     ops.impl("transpose_kv_cache_by_block", &vllm_ascend::meta::transpose_kv_cache_by_block_meta);
+    // sum_lstm
+    ops.impl("npu_sum_lstm", &vllm_ascend::meta::npu_sum_lstm_meta);
 }
 }

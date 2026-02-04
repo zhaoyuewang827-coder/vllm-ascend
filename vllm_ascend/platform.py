@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import math
 import os
-from typing import TYPE_CHECKING, Any
+import time
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 from uuid import uuid4
 
 import torch
@@ -59,6 +60,49 @@ else:
     FlexibleArgumentParser = None
 
 _CUSTOM_OP_REGISTERED = False
+
+
+def _rms_norm(x: torch.Tensor, eps: float, weight: Optional[torch.Tensor],
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
+    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    y = x * inv_rms
+    if weight is not None:
+        y = y * weight
+    if bias is not None:
+        y = y + bias
+    return y
+
+
+def _reference_sum_lstm(
+    states4: torch.Tensor, z4: torch.Tensor, prev_cell: torch.Tensor,
+    w_cell: Optional[torch.Tensor], b_cell: Optional[torch.Tensor],
+    w_state: Optional[torch.Tensor], b_state: Optional[torch.Tensor],
+    alpha: float, eps_cell: float, eps_state: float, fast_gelu: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    D = prev_cell.size(-1)
+    s_f, s_i, s_o, s_c = states4.split(D, dim=-1)
+    z_f, z_i, z_o, z_c = z4.split(D, dim=-1)
+
+    pre_f = s_f + alpha * z_f
+    pre_i = s_i + alpha * z_i
+    pre_o = s_o + alpha * z_o
+    c_pre = s_c + alpha * z_c
+
+    f = torch.sigmoid(pre_f)
+    i = torch.sigmoid(pre_i)
+
+    cn = _rms_norm(c_pre, eps_cell, w_cell, b_cell)
+    c_act = torch.nn.functional.gelu(
+        cn, approximate="tanh" if fast_gelu else "none")
+    c_new = prev_cell * f + c_act * i
+
+    sn = _rms_norm(c_new, eps_state, w_state, b_state)
+    s_act = torch.nn.functional.gelu(
+        sn, approximate="tanh" if fast_gelu else "none")
+
+    o = torch.sigmoid(pre_o)
+    state = s_act * o
+    return state, c_new
 
 
 def config_deprecated_logging():
@@ -456,6 +500,169 @@ class NPUPlatform(Platform):
             else:
                 os.environ["ASCEND_CUSTOM_OPP_PATH"] = CUSTOM_OPP_PATH
         _CUSTOM_OP_REGISTERED = True
+
+        # ========== SumLstm Accuracy & Performance Test ==========
+        try:
+            from vllm_ascend.utils import enable_custom_op
+            enable_custom_op()
+
+            dtype = torch.float16
+            eps_cell = 1e-6
+            eps_state = 1e-6
+            atol = 2e-2
+            rtol = 2e-2
+            warmup_iters = 3
+            bench_iters = 10
+
+            # (rows, D, use_w_cell, use_w_state, alpha, fast_gelu, label)
+            test_cases = [
+                # Basic D sweep (no weights)
+                (1,   64,   False, False, 1.0,  True,  "none"),
+                (4,   128,  False, False, 1.0,  True,  "none"),
+                (16,  256,  False, False, 1.0,  True,  "none"),
+                (32,  512,  False, False, 1.0,  True,  "none"),
+                (64,  1024, False, False, 1.0,  True,  "none"),
+                # Weight combinations
+                (8,   128,  True,  True,  1.0,  True,  "cell+state"),
+                (16,  256,  True,  False, 1.0,  True,  "cell"),
+                (16,  256,  False, True,  1.0,  True,  "state"),
+                # Alpha and GELU variants
+                (16,  256,  False, False, 0.35, True,  "none"),
+                (16,  256,  False, False, 1.0,  False, "none"),
+                # ---- Additional 10 cases ----
+                # Real-world shape: 32 tokens * 1 head, D=4096
+                (32,  4096, False, False, 1.0,  True,  "none"),
+                # Large batch with small D
+                (128, 64,   False, False, 1.0,  True,  "none"),
+                # Large batch with large D
+                (128, 1024, False, False, 1.0,  True,  "none"),
+                # Non-power-of-2 D values
+                (16,  768,  False, False, 1.0,  True,  "none"),
+                (8,   384,  False, False, 1.0,  True,  "none"),
+                # Weights + exact GELU
+                (16,  512,  True,  True,  1.0,  False, "cell+state"),
+                # Weights + non-default alpha
+                (32,  256,  True,  True,  0.35, True,  "cell+state"),
+                # Single sample with weights and large D
+                (1,   1024, True,  True,  1.0,  True,  "cell+state"),
+                # Exact GELU + large batch
+                (64,  512,  False, False, 1.0,  False, "none"),
+                # Small alpha + weights + non-power-of-2 D
+                (8,   768,  True,  True,  0.5,  True,  "cell+state"),
+            ]
+
+            # ---- Constant-input diagnostic: find D threshold ----
+            for diag_D in [64, 128, 256, 512, 768, 1024]:
+                diag_states = torch.zeros(1, 4 * diag_D, dtype=dtype)
+                diag_z4 = torch.zeros(1, 4 * diag_D, dtype=dtype)
+                diag_prev = torch.full((1, diag_D), 0.5, dtype=dtype)
+
+                with torch.no_grad():
+                    diag_ref_s, diag_ref_c = _reference_sum_lstm(
+                        diag_states, diag_z4, diag_prev,
+                        None, None, None, None, 1.0, eps_cell, eps_state, True)
+                    diag_npu_s, diag_npu_c = torch.ops._C_ascend.npu_sum_lstm(
+                        diag_states.npu(), diag_z4.npu(), diag_prev.npu(),
+                        None, None, None, None, 1.0, eps_cell, eps_state, True)
+                torch.npu.synchronize()
+                s_diff = (diag_ref_s - diag_npu_s.cpu()).abs().max().item()
+                c_diff = (diag_ref_c - diag_npu_c.cpu()).abs().max().item()
+                tag = "OK" if s_diff < 0.01 and c_diff < 0.01 else "ZERO" if s_diff > 0.1 else "BAD"
+                logger.info(f"[SumLstm] DIAG D={diag_D:<5d} | "
+                            f"npu_state[0]={diag_npu_s.cpu().flatten()[0].item():.6f} "
+                            f"npu_cell[0]={diag_npu_c.cpu().flatten()[0].item():.6f} | "
+                            f"state_diff={s_diff:.2e} cell_diff={c_diff:.2e} [{tag}]")
+            # ---- End diagnostic ----
+
+            logger.info("[SumLstm] ============ Accuracy & Performance Test ============")
+            passed = 0
+            for idx, (rows, D, use_wc, use_ws, alpha, fast_gelu, wlabel) in enumerate(test_cases, 1):
+                torch.manual_seed(42 + idx)
+                # Generate on CPU, then copy to NPU (matches E2E test pattern)
+                states4_cpu = torch.randn(rows, 4 * D, dtype=dtype)
+                z4_cpu = torch.randn(rows, 4 * D, dtype=dtype)
+                prev_cell_cpu = torch.randn(rows, D, dtype=dtype)
+
+                w_cell_cpu = torch.randn(D, dtype=dtype) if use_wc else None
+                b_cell_cpu = torch.randn(D, dtype=dtype) if use_wc else None
+                w_state_cpu = torch.randn(D, dtype=dtype) if use_ws else None
+                b_state_cpu = torch.randn(D, dtype=dtype) if use_ws else None
+
+                states4 = states4_cpu.npu()
+                z4 = z4_cpu.npu()
+                prev_cell = prev_cell_cpu.npu()
+                w_cell = w_cell_cpu.npu() if use_wc else None
+                b_cell = b_cell_cpu.npu() if use_wc else None
+                w_state = w_state_cpu.npu() if use_ws else None
+                b_state = b_state_cpu.npu() if use_ws else None
+
+                # Golden reference (CPU)
+                with torch.no_grad():
+                    ref_state, ref_cell = _reference_sum_lstm(
+                        states4_cpu, z4_cpu, prev_cell_cpu,
+                        w_cell_cpu, b_cell_cpu,
+                        w_state_cpu, b_state_cpu,
+                        alpha, eps_cell, eps_state, fast_gelu)
+
+                # NPU result
+                with torch.no_grad():
+                    npu_state, npu_cell = torch.ops._C_ascend.npu_sum_lstm(
+                        states4, z4, prev_cell,
+                        w_cell, b_cell, w_state, b_state,
+                        alpha, eps_cell, eps_state, fast_gelu)
+                torch.npu.synchronize()
+
+                npu_state_cpu = npu_state.cpu()
+                npu_cell_cpu = npu_cell.cpu()
+                state_abs = (ref_state - npu_state_cpu).abs().max().item()
+                cell_abs = (ref_cell - npu_cell_cpu).abs().max().item()
+
+                # Diagnostic for first failing case
+                if idx == 1:
+                    logger.info(f"[SumLstm] DEBUG Case 1: ref_state[:5]={ref_state.flatten()[:5].tolist()}")
+                    logger.info(f"[SumLstm] DEBUG Case 1: npu_state[:5]={npu_state_cpu.flatten()[:5].tolist()}")
+                    logger.info(f"[SumLstm] DEBUG Case 1: ref_cell[:5]={ref_cell.flatten()[:5].tolist()}")
+                    logger.info(f"[SumLstm] DEBUG Case 1: npu_cell[:5]={npu_cell_cpu.flatten()[:5].tolist()}")
+
+                ok = state_abs <= atol and cell_abs <= atol
+                # Also check relative tolerance
+                state_rel = ((ref_state - npu_state_cpu).abs() / (ref_state.abs() + 1e-6)).max().item()
+                cell_rel = ((ref_cell - npu_cell_cpu).abs() / (ref_cell.abs() + 1e-6)).max().item()
+                if not ok:
+                    ok = state_rel <= rtol and cell_rel <= rtol
+
+                # Performance benchmark
+                for _ in range(warmup_iters):
+                    torch.ops._C_ascend.npu_sum_lstm(
+                        states4, z4, prev_cell,
+                        w_cell, b_cell, w_state, b_state,
+                        alpha, eps_cell, eps_state, fast_gelu)
+                torch.npu.synchronize()
+
+                t0 = time.perf_counter()
+                for _ in range(bench_iters):
+                    torch.ops._C_ascend.npu_sum_lstm(
+                        states4, z4, prev_cell,
+                        w_cell, b_cell, w_state, b_state,
+                        alpha, eps_cell, eps_state, fast_gelu)
+                torch.npu.synchronize()
+                elapsed_ms = (time.perf_counter() - t0) / bench_iters * 1000
+
+                gelu_tag = "fast" if fast_gelu else "exact"
+                status = "PASS" if ok else "FAIL"
+                if ok:
+                    passed += 1
+
+                logger.info(
+                    f"[SumLstm] Case {idx:2d}: rows={rows:<5d} D={D:<5d} "
+                    f"weights={wlabel:<12s} alpha={alpha}  gelu={gelu_tag:<5s} | "
+                    f"state_abs={state_abs:.2e} cell_abs={cell_abs:.2e} | "
+                    f"time={elapsed_ms:.2f}ms [{status}]")
+
+            logger.info(f"[SumLstm] ============ Result: {passed}/{len(test_cases)} PASSED ====================")
+        except Exception as e:
+            logger.warning(f"SumLstm test FAILED: {e}")
+        # ========== End of SumLstm test ==========
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config):

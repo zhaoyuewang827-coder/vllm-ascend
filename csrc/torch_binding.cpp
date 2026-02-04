@@ -1343,6 +1343,28 @@ std::tuple<at::Tensor,at::Tensor, at::Tensor> npu_add_rms_norm_bias(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, rstd, x);
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_sum_lstm(
+    const at::Tensor& states_4d,
+    const at::Tensor& z4_4d,
+    const at::Tensor& prev_cell,
+    const c10::optional<at::Tensor>& w_cell,
+    const c10::optional<at::Tensor>& b_cell,
+    const c10::optional<at::Tensor>& w_state,
+    const c10::optional<at::Tensor>& b_state,
+    double alpha,
+    double eps_cell,
+    double eps_state,
+    bool use_fast_gelu)
+{
+    // 输出形状与 prev_cell 相同
+    at::Tensor out_state = at::empty(prev_cell.sizes(), prev_cell.options());
+    at::Tensor out_cell = at::empty(prev_cell.sizes(), prev_cell.options());
+    EXEC_NPU_CMD(aclnnSumLstm, states_4d, z4_4d, prev_cell, w_cell, b_cell,
+                 w_state, b_state, alpha, eps_cell, eps_state, use_fast_gelu,
+                 out_state, out_cell);
+    return std::tuple<at::Tensor, at::Tensor>(out_state, out_cell);
+}
+
 void transpose_kv_cache_by_block(
     const at::TensorList &kCache,
     const at::TensorList &vCache,
@@ -1541,4 +1563,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "transpose_kv_cache_by_block(Tensor[] kCache, Tensor[] vCache, Tensor blockIDs, int blockSize, int headNum, int headDim, int splitNum, int layerNum) -> ()"
     );
     ops.impl("transpose_kv_cache_by_block", torch::kPrivateUse1, &vllm_ascend::transpose_kv_cache_by_block);
+
+    ops.def(
+        "npu_sum_lstm(Tensor states_4d, "
+                     "Tensor z4_4d, "
+                     "Tensor prev_cell, "
+                     "Tensor? w_cell=None, "
+                     "Tensor? b_cell=None, "
+                     "Tensor? w_state=None, "
+                     "Tensor? b_state=None, "
+                     "float alpha=1.0, "
+                     "float eps_cell=1e-6, "
+                     "float eps_state=1e-6, "
+                     "bool use_fast_gelu=True) "
+        "-> (Tensor out_state, Tensor out_cell)"
+    );
+    ops.impl("npu_sum_lstm", torch::kPrivateUse1, &vllm_ascend::npu_sum_lstm);
 }
